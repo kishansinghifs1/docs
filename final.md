@@ -1133,7 +1133,771 @@ The vulnerability tracking layer transforms raw scanner output into a governed s
 
 ---
 
-## 11. StyleCI Integration
+## 11. CVSS Scoring Engine & Finding Normalizer — Component Deep Dive
+
+This section explains how the pipeline's **Layer 3** security engine works in practice. It moves beyond the high-level stages and dissects every class, every data transformation, and every scoring decision from the moment a scanner report lands on disk to the moment the pipeline gate passes or fails.
+
+### 11.1 Why a Custom Engine?
+
+The pipeline uses three very different scanners:
+
+* **Composer Audit** speaks in CVEs, package names, and SemVer ranges.
+* **PHPStan / Larastan** speaks in static-analysis rules, file paths, and line numbers.
+* **OWASP ZAP** speaks in runtime alerts, URLs, risk codes, and instances.
+
+None of these tools use the same severity model. To enforce a single, auditable gate, the project implements a custom engine in `app/Security/`. This engine:
+
+1. **Normalizes** heterogeneous reports into one `Finding` object.
+2. **Classifies** each finding by PHI (Protected Health Information) exposure.
+3. **Maps** each finding to CVSS v3.1 base metrics.
+4. **Calculates** base and healthcare-escalated CVSS scores.
+5. **Evaluates** findings against a configurable security gate.
+6. **Reports** results as JSON and an interactive HTML dashboard.
+
+### 11.2 End-to-End Data Flow
+
+```mermaid
+flowchart LR
+    subgraph Inputs
+        A[composer-audit-report.json]
+        B[phpstan-report.json]
+        C[zap_report.json]
+    end
+
+    subgraph Normalization
+        N[FindingNormalizer]
+    end
+
+    subgraph Model
+        F[Finding DTO]
+    end
+
+    subgraph Scoring
+        CM[CweMapper]
+        PC[PhiClassifier]
+        FMM[FindingMetricsMapper]
+        CC[CvssCalculator]
+        HE[HealthcareEscalator]
+        CS[CvssScorer]
+    end
+
+    subgraph Gate
+        SG[SecurityGate]
+        GR[GateResult]
+    end
+
+    subgraph Outputs
+        OF[findings.json]
+        SF[scored_findings.json]
+        HR[security-report.html]
+        HT[security_trends.json]
+    end
+
+    A --> N
+    B --> N
+    C --> N
+    N --> F
+    F --> CM
+    CM --> PC
+    PC --> FMM
+    FMM --> CC
+    CC --> HE
+    HE --> CC
+    CC --> CS
+    CS --> SG
+    SG --> GR
+    CS --> OF
+    CS --> SF
+    CS --> HR
+    CS --> HT
+```
+
+> **Rendered PNG:** A rendered version of this component diagram is available at [`docs/CVSS_SCORING_ENGINE_DIAGRAM.png`](docs/CVSS_SCORING_ENGINE_DIAGRAM.png). The editable source is at [`docs/CVSS_SCORING_ENGINE_DIAGRAM.mmd`](docs/CVSS_SCORING_ENGINE_DIAGRAM.mmd).
+
+### 11.3 Command Entry Point: `SecurityScoreCommand`
+
+The Artisan command `security:score` is the orchestrator. Its signature is:
+
+```bash
+php artisan security:score \
+  --composer-audit=composer-audit-report.json \
+  --phpstan=phpstan-report.json \
+  --zap=zap_report.json \
+  --output-findings=findings.json \
+  --output-scored=scored_findings.json \
+  --output-html=security-report.html \
+  --history=security_trends.json \
+  --fail-on-gate=true
+```
+
+#### What the command does step by step
+
+| Step | Code Action | Purpose |
+|------|-------------|---------|
+| 1 | Instantiates `FindingNormalizer` and `CvssScorer`. | Prepares the two core services. |
+| 2 | Calls `parseComposerAudit()`, `parsePhpStan()`, `parseZap()`. | Converts each scanner's JSON into `Finding` objects. |
+| 3 | Merges findings into `$allFindings`. | Creates one unified list. |
+| 4 | Writes `findings.json` (Layer 1). | Preserves the raw normalized view. |
+| 5 | Iterates through every `Finding` and calls `$scorer->score()`. | Produces scored findings (Layer 3). |
+| 6 | Computes summary statistics: counts by severity, max score, PHI tiers. | Feeds the dashboard and gate. |
+| 7 | Writes `scored_findings.json`. | Machine-readable scored output. |
+| 8 | Updates `security_trends.json` history. | Enables trend charts. |
+| 9 | Generates `security-report.html`. | Human-readable report. |
+| 10 | Calls `SecurityGate::evaluate()`. | Decides if the pipeline should fail. |
+| 11 | Prints a summary table and returns exit code. | CI surface for GitLab. |
+
+If no reports are found, the command still writes empty-but-valid JSON files and exits successfully, so a missing ZAP report (for example) does not crash the pipeline.
+
+### 11.4 `FindingNormalizer` — The Universal Translator
+
+`App\Security\Findings\FindingNormalizer` is responsible for reading each scanner's JSON and emitting `Finding` objects. It has three public parsers and one private JSON loader.
+
+#### 11.4.1 `loadJson()` — Input Validation
+
+```php
+private function loadJson(string $path): ?array
+```
+
+This helper:
+
+1. Checks if the file exists.
+2. Reads the contents.
+3. Decodes JSON.
+4. Returns `null` if any step fails (file missing, empty, invalid JSON, or not an array).
+
+Returning `null` lets the caller silently skip a missing report rather than crash.
+
+#### 11.4.2 `parseComposerAudit()` — Dependency CVEs
+
+Composer Audit emits JSON like this:
+
+```json
+{
+  "advisories": {
+    "guzzlehttp/guzzle": [
+      {
+        "advisoryId": "GHSA-xxxx-xxxx-xxxx",
+        "cve": "CVE-2024-XXXX",
+        "title": "...",
+        "severity": "high",
+        "affectedVersions": ">=7.0,<7.8",
+        "link": "https://github.com/advisories/..."
+      }
+    ]
+  },
+  "abandoned": {
+    "vendor/legacy": "vendor/modern"
+  }
+}
+```
+
+The normalizer:
+
+* Loops through `advisories[packageName]`.
+* Normalizes `severity` to lowercase and validates it against `['low','medium','high','critical','info']`.
+* Builds a title: `CVE-2024-XXXX: {title}` or `GHSA-...: {title}`.
+* Builds a human-readable description with package name, affected versions, and link.
+* Creates a `Finding` with:
+  * `source`: `composer-audit`
+  * `cwe`: `CWE-937` (known vulnerable components)
+  * `file`: `composer.lock`
+  * `metadata`: package name, advisory ID, CVE, affected versions, reported date
+
+It also parses the `abandoned` block. Abandoned packages are mapped to:
+
+* `cwe`: `CWE-1104` (unmaintained third-party components)
+* `severity`: `low`
+* `file`: `composer.json`
+* `metadata`: replacement suggestion and `isAbandoned: true`
+
+#### 11.4.3 `parsePhpStan()` — Static Analysis Messages
+
+PHPStan JSON has this shape:
+
+```json
+{
+  "files": {
+    "/data/lh-ehr-laravel/app/Models/Patient.php": {
+      "messages": [
+        {
+          "message": "Call to an undefined method ...",
+          "line": 42,
+          "ignorable": true
+        }
+      ]
+    }
+  },
+  "errors": ["Fatal error..."]
+}
+```
+
+The normalizer:
+
+* Iterates through each file's `messages`.
+* Converts absolute paths to project-relative paths by stripping `$basePath`.
+* Derives a severity heuristic:
+  * If the message contains `deprecated` → `low`
+  * If it contains `sql`, `inject`, `bypass`, `csrf`, or `xss` → `high`
+  * Otherwise → `medium`
+* Truncates titles longer than 60 characters.
+* Stores `ignorable` in metadata.
+* Parses top-level `errors` as high-severity findings without file/line context.
+
+The severity heuristic is intentionally conservative: any message that hints at a security pattern is elevated to `high` so the metrics mapper will treat it seriously.
+
+#### 11.4.4 `parseZap()` — Dynamic Scan Alerts
+
+ZAP JSON has nested `site` → `alerts` arrays. The normalizer defensively handles both a single site object and an array of sites:
+
+```php
+$sites = $data['site'] ?? [];
+if (is_array($sites) && (isset($sites['alerts']) || isset($sites['@name']))) {
+    $sites = [$sites];
+}
+```
+
+For each alert it extracts:
+
+* `alert` / `name` → `title`
+* `riskcode` → `severity`
+  * `3` → high
+  * `2` → medium
+  * `1` → low
+  * `0` / default → info
+* `desc` → `description` (HTML stripped)
+* `cweid` → `cwe` (e.g., `CWE-79`)
+* First instance URI → `url` (path only)
+* `instances`, `solution`, `reference`, `confidence` → `metadata`
+
+ZAP findings have no file or line number because they are runtime observations, so `file` and `line` are `null`.
+
+### 11.5 `Finding` — The Universal Data Transfer Object
+
+`App\Security\Findings\Finding` is a plain PHP class with public properties:
+
+```php
+class Finding
+{
+    public string $id;
+    public string $source;          // composer-audit | phpstan | zap
+    public string $title;
+    public string $description;
+    public string $severity;        // critical | high | medium | low | info
+    public ?string $file;
+    public ?int $line;
+    public ?string $url;
+    public ?string $cwe;            // e.g. CWE-89
+    public ?float $cvss_base;
+    public ?string $phi_tier;       // Critical | Moderate | Non-PHI
+    public ?float $cvss_adjusted;
+    public array $metadata;
+}
+```
+
+#### ID Generation
+
+The `id` is a deterministic MD5 hash of:
+
+```
+source + title + file + line + url + cwe + shortHash(description)
+```
+
+This means the same vulnerability in the same location produces the same ID across pipeline runs, which is essential for deduplication and trend tracking.
+
+#### CWE Normalization
+
+The constructor guarantees every CWE starts with `CWE-` and is uppercase:
+
+```php
+if ($cwe !== null) {
+    $cwe = strtoupper($cwe);
+    $cwe = str_starts_with($cwe, 'CWE-') ? $cwe : 'CWE-' . $cwe;
+}
+```
+
+This prevents `89`, `cwe-89`, and `CWE-89` from being treated as different weaknesses.
+
+### 11.6 `CweMapper` — Mapping Findings to CWEs
+
+`App\Security\Cvss\CweMapper` assigns a CWE when the normalizer did not already provide one. It has source-specific logic:
+
+#### Composer Audit
+
+* Known vulnerable package → `CWE-937`
+* Abandoned package → `CWE-1104`
+
+#### PHPStan
+
+The mapper inspects the description text:
+
+| Description contains | Mapped CWE |
+|----------------------|------------|
+| `null` | `CWE-476` (NULL Pointer Dereference) |
+| `undefined`, `does not exist` | `CWE-398` (Code Quality / Indicator) |
+| `deprecated` | `CWE-477` (Use of Obsolete Function) |
+| default | `CWE-703` (Improper Check of Exceptional Conditions) |
+
+#### ZAP
+
+The mapper maintains a keyword dictionary of ZAP alert names/descriptions to CWEs:
+
+| ZAP Keyword | CWE |
+|-------------|-----|
+| sql injection | CWE-89 |
+| cross site scripting / xss | CWE-79 |
+| csrf | CWE-352 |
+| path traversal | CWE-22 |
+| open redirect | CWE-601 |
+| ssrf | CWE-918 |
+| clickjacking / x-frame-options | CWE-1021 |
+| cookie without httponly | CWE-1004 |
+| cookie without secure | CWE-614 |
+| strict-transport-security | CWE-311 |
+| information disclosure | CWE-200 |
+| ... | ... |
+
+If no keyword matches, the default is `CWE-693` (Protection Mechanism Failure), a safe catch-all for misconfiguration findings.
+
+### 11.7 `FindingMetricsMapper` — From CWE to CVSS Vector
+
+`App\Security\Cvss\FindingMetricsMapper` converts a `Finding` into an 8-element CVSS v3.1 base metrics array:
+
+```php
+[
+    'AV' => 'N',  // Attack Vector: Network
+    'AC' => 'L',  // Attack Complexity: Low
+    'PR' => 'N',  // Privileges Required: None
+    'UI' => 'N',  // User Interaction: None
+    'S'  => 'U',  // Scope: Unchanged
+    'C'  => 'H',  // Confidentiality: High
+    'I'  => 'H',  // Integrity: High
+    'A'  => 'H',  // Availability: High
+]
+```
+
+#### Mapping Priority
+
+The mapper uses a three-tier fallback:
+
+1. **Exact CWE lookup** — if the CWE exists in `CWE_VECTORS`, return its vector.
+2. **Keyword matching** — search title/description for keywords like `sql injection`, `xss`, `csrf`, etc., and map to the corresponding CWE vector.
+3. **Severity fallback** — if nothing else matches, derive a generic vector from the finding's severity.
+
+#### CWE Vector Dictionary Highlights
+
+| CWE | Category | Vector highlights |
+|-----|----------|-------------------|
+| CWE-89 | SQL Injection | `S:C`, `C:H`, `I:H`, `A:H` |
+| CWE-79 | XSS | `S:C`, `UI:R`, `C:L`, `I:L` |
+| CWE-287 | Improper Authentication | `C:H`, `I:H` |
+| CWE-352 | CSRF | `UI:R`, `I:H` |
+| CWE-22 | Path Traversal | `C:H` |
+| CWE-200 | Information Exposure | `C:H` |
+| CWE-311 | Missing Encryption | `C:H` |
+| CWE-937 | Known Vulnerable Component | `null` → severity fallback |
+| CWE-1104 | Unmaintained Component | `AC:H`, low impact |
+| CWE-476 | NULL Pointer Deref | `A:H` |
+
+The dictionary is deliberately curated for healthcare web applications, emphasizing confidentiality and integrity impact because PHI exposure is the primary risk.
+
+#### Severity Fallback
+
+When no CWE vector is available, the mapper falls back to a generic vector based on severity:
+
+| Severity | Base Vector |
+|----------|-------------|
+| critical | Network, Low, None, None, Unchanged, High, High, High |
+| high | Network, Low, None, None, Unchanged, High, High, None |
+| medium | Network, Low, None, None, Unchanged, Low, Low, None |
+| low | Network, Low, None, None, Unchanged, Low, None, None |
+| info | Network, High, None, None, Unchanged, None, None, None |
+
+### 11.8 `CvssCalculator` — The Mathematics
+
+`App\Security\Cvss\CvssCalculator` implements the official CVSS v3.1 formula. It does not call an external library, so every score is reproducible and auditable.
+
+#### Metric Value Maps
+
+```php
+$avMap = ['N' => 0.85, 'A' => 0.62, 'L' => 0.55, 'P' => 0.20];
+$acMap = ['L' => 0.77, 'H' => 0.44];
+$prMap = [
+    'U' => ['N' => 0.85, 'L' => 0.62, 'H' => 0.27],
+    'C' => ['N' => 0.85, 'L' => 0.68, 'H' => 0.50]
+];
+$uiMap = ['N' => 0.85, 'R' => 0.62];
+$ciaMap = ['N' => 0.00, 'L' => 0.22, 'H' => 0.56];
+```
+
+#### Formula
+
+1. **Impact Sub-Score (ISS):**
+   ```
+   ISS = 1 - [(1 - C) × (1 - I) × (1 - A)]
+   ```
+
+2. **Impact:**
+   * If `Scope` is **Unchanged**:
+     ```
+     Impact = 6.42 × ISS
+     ```
+   * If `Scope` is **Changed**:
+     ```
+     Impact = 7.52 × (ISS - 0.029) - 3.25 × (ISS - 0.029)^15
+     ```
+
+3. **Exploitability:**
+   ```
+   Exploitability = 8.22 × AV × AC × PR × UI
+   ```
+
+4. **Base Score:**
+   * If `Impact <= 0` → score is `0.0`
+   * If `Scope` is **Unchanged**:
+     ```
+     Score = Impact + Exploitability
+     ```
+   * If `Scope` is **Changed**:
+     ```
+     Score = 1.08 × (Impact + Exploitability)
+     ```
+
+5. **Rounding:**
+   ```php
+   return min(10.0, ceil(round($score, 9) * 10) / 10);
+   ```
+   This rounds up to one decimal place, matching FIRST CVSS specification behavior.
+
+#### Vector String Builder
+
+The calculator also builds the standard `CVSS:3.1/...` vector string for reporting:
+
+```php
+CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H
+```
+
+### 11.9 `PhiClassifier` — PHI Exposure Classification
+
+Because this is an EHR, a vulnerability in a patient-related file is more serious than the same vulnerability in a utility file. `App\Security\Phi\PhiClassifier` classifies findings by file path or URL.
+
+#### Critical PHI Patterns
+
+| Pattern | Example location |
+|---------|------------------|
+| `patient` | `app/Http/Controllers/PatientController.php` |
+| `prescription` | `app/Services/PrescriptionService.php` |
+| `medicalhistory`, `medical-history` | `app/Models/MedicalHistory.php` |
+| `diagnosis` | `routes/diagnosis.php` |
+| `encounter` | `app/Http/Resources/EncounterResource.php` |
+| `clinical` | `app/Clinical/...` |
+| `facesheet`, `face-sheet` | `resources/views/facesheet.blade.php` |
+| `billing` | `app/Billing/...` |
+
+#### Moderate PHI Patterns
+
+| Pattern | Example location |
+|---------|------------------|
+| `user` | `app/Models/User.php` |
+| `address` | `app/Http/Resources/AddressResource.php` |
+| `facility`, `facilities` | `app/Models/Facility.php` |
+| `calendar` | `routes/calendar.php` |
+| `appointment` | `app/Services/AppointmentService.php` |
+
+If no pattern matches, the finding is `Non-PHI`.
+
+#### Classification Logic
+
+```php
+public function classifyPath(?string $filePath): string
+{
+    // Critical wins over Moderate.
+    foreach ($this->criticalPatterns as $pattern) {
+        if (str_contains($normalizedPath, $pattern)) return 'Critical';
+    }
+    foreach ($this->moderatePatterns as $pattern) {
+        if (str_contains($normalizedPath, $pattern)) return 'Moderate';
+    }
+    return 'Non-PHI';
+}
+```
+
+For ZAP findings, `classifyUrl()` uses the same patterns against the URL path.
+
+### 11.10 `HealthcareEscalator` — Adjusting for PHI
+
+`App\Security\Cvss\HealthcareEscalator` modifies the base CVSS metrics based on PHI tier.
+
+#### Critical PHI
+
+```php
+if ($phiTier === 'Critical') {
+    $escalated['S'] = 'C';   // Scope becomes Changed
+    $escalated['C'] = 'H';   // Confidentiality becomes High
+    $escalated['I'] = 'H';   // Integrity becomes High
+    if ($escalated['A'] === 'N') {
+        $escalated['A'] = 'L'; // Availability at least Low
+    }
+}
+```
+
+This reflects the reality that a vulnerability touching patient records affects not just the vulnerable component but the entire EHR trust boundary (`Scope: Changed`), and the impact on confidentiality and integrity is severe.
+
+#### Moderate PHI
+
+```php
+elseif ($phiTier === 'Moderate') {
+    if ($escalated['C'] === 'N') $escalated['C'] = 'L';
+    if ($escalated['I'] === 'N') $escalated['I'] = 'L';
+}
+```
+
+Moderate PHI findings get a small bump if confidentiality or integrity was previously negligible.
+
+### 11.11 `CvssScorer` — Putting It All Together
+
+`App\Security\Cvss\CvssScorer` is the orchestrator of scoring. Its `score()` method runs a fixed pipeline for each `Finding`:
+
+```php
+public function score(Finding $finding): Finding
+{
+    // 1. Resolve CWE if missing
+    if (empty($finding->cwe)) {
+        $finding->cwe = $this->cweMapper->resolve($finding);
+    }
+
+    // 2. Classify PHI tier
+    $finding->phi_tier = $this->classifyPhi($finding);
+
+    // 3. Map to CVSS base metrics
+    $baseMetrics = $this->metricsMapper->map($finding);
+
+    // 4. Calculate base score
+    $finding->cvss_base = $this->calculator->calculate($baseMetrics);
+
+    // 5. Escalate metrics for PHI
+    $adjustedMetrics = $this->escalator->escalate($baseMetrics, $finding->phi_tier);
+    $finding->cvss_adjusted = $this->calculator->calculate($adjustedMetrics);
+
+    // 6. Store vectors in metadata
+    $finding->metadata['cvss_base_vector'] = ...;
+    $finding->metadata['cvss_adjusted_vector'] = ...;
+    $finding->metadata['cvss_vector'] = $finding->metadata['cvss_adjusted_vector'];
+
+    return $finding;
+}
+```
+
+The scorer is fully dependency-injectable. Every sub-component (`PhiClassifier`, `CweMapper`, `FindingMetricsMapper`, `CvssCalculator`, `HealthcareEscalator`) can be replaced for testing or customization.
+
+### 11.12 `SecurityGate` — The Final Decision
+
+`App\Security\Gate\SecurityGate` implements the policy layer.
+
+#### Default Thresholds
+
+```php
+$generalThreshold = 8.5;   // Any finding with adjusted score >= 8.5 violates
+$phiThreshold     = 7.0;   // PHI-affected findings with score >= 7.0 violate
+$phiTiers         = ['Critical', 'Moderate'];
+```
+
+#### Evaluation Logic
+
+```php
+foreach ($scoredFindings as $sf) {
+    $score   = $sf['cvss_adjusted'] ?? 0.0;
+    $phiTier = $sf['phi_tier'] ?? 'Non-PHI';
+
+    $violatesGeneral = $score >= $this->generalThreshold;
+    $violatesPhi     = in_array($phiTier, $this->phiTiers, true) && $score >= $this->phiThreshold;
+
+    if ($violatesGeneral || $violatesPhi) {
+        $violatingFindings[] = $sf;
+    }
+}
+```
+
+The gate returns a `GateResult` object containing:
+
+* `isViolated` — boolean
+* `violatingFindings` — array of findings that breached the gate
+
+This design means a **high-severity vulnerability in a patient controller** (score 7.5, Critical PHI) will fail the gate, while the same vulnerability in a non-PHI utility file (score 7.5, Non-PHI) will pass because it does not reach the 8.5 general threshold.
+
+### 11.13 `HtmlReportGenerator` — Human-Readable Reporting
+
+`App\Security\Reporting\HtmlReportGenerator` builds a self-contained `security-report.html` file with no external build step. It:
+
+1. Accepts `$scoredData` and `$history` arrays.
+2. Computes gate status, branch, and commit metadata.
+3. Injects the data as JSON into a JavaScript template.
+4. Writes a complete HTML file with:
+   * Summary cards (Total Findings, Max CVSS, PHI Exposure)
+   * Gate status badge
+   * Trend chart (powered by Chart.js CDN)
+   * Severity and source filters
+   * Sortable findings table
+   * Expandable detail rows with descriptions and CVSS vectors
+
+The report is deliberately a single file so it can be opened directly from a GitLab artifact without a server.
+
+### 11.14 Example: Scoring One Finding End-to-End
+
+Let's trace a hypothetical ZAP finding.
+
+**Input from ZAP:**
+
+```json
+{
+  "alert": "SQL Injection",
+  "riskcode": "3",
+  "desc": "<p>SQL injection may be possible...</p>",
+  "cweid": "89",
+  "instances": [{"uri": "http://127.0.0.1:8000/patient/search"}]
+}
+```
+
+**Step 1 — Normalizer:**
+
+* `source` = `zap`
+* `title` = `"SQL Injection"`
+* `severity` = `high` (riskcode 3)
+* `cwe` = `CWE-89`
+* `url` = `/patient/search`
+* `metadata.confidence`, `metadata.instances`, etc.
+
+**Step 2 — CweMapper:**
+
+* CWE already present (`CWE-89`), so mapper does not change it.
+
+**Step 3 — PhiClassifier:**
+
+* URL contains `patient` → `phi_tier` = `Critical`.
+
+**Step 4 — FindingMetricsMapper:**
+
+* `CWE-89` vector:
+  ```
+  AV:N, AC:L, PR:N, UI:N, S:C, C:H, I:H, A:H
+  ```
+
+**Step 5 — Base Score Calculation:**
+
+* ISS = 1 - (1-0.56)(1-0.56)(1-0.56) = 0.914
+* Impact (Scope Changed) = 7.52 × (0.914 - 0.029) - 3.25 × (0.914 - 0.029)^15 ≈ 6.65
+* Exploitability = 8.22 × 0.85 × 0.77 × 0.85 × 0.85 ≈ 3.87
+* Base Score = 1.08 × (6.65 + 3.87) ≈ 10.0 → capped at **10.0**
+
+**Step 6 — Healthcare Escalation:**
+
+* Critical PHI: S already Changed, C already High, I already High, A already High.
+* No change needed; adjusted metrics are identical to base.
+* `cvss_adjusted` = **10.0**
+
+**Step 7 — Gate:**
+
+* Score 10.0 >= general threshold 8.5 → **VIOLATION**.
+* Pipeline fails (if `--fail-on-gate=true`).
+
+### 11.15 Example: A PHPStan Type Error
+
+**Input from PHPStan:**
+
+```json
+{
+  "message": "Call to an undefined method App\\Models\\User::getRole().",
+  "line": 55
+}
+```
+
+**Step 1 — Normalizer:**
+
+* `source` = `phpstan`
+* `severity` = `medium` (no security keyword)
+* `file` = `app/Models/User.php`
+* `cwe` = `null`
+
+**Step 2 — CweMapper:**
+
+* Description contains `undefined` → `CWE-398` (Code Quality Indicator).
+
+**Step 3 — PhiClassifier:**
+
+* File contains `user` → `phi_tier` = `Moderate`.
+
+**Step 4 — Metrics Mapper:**
+
+* `CWE-398` vector:
+  ```
+  AV:N, AC:H, PR:N, UI:N, S:U, C:N, I:L, A:N
+  ```
+
+**Step 5 — Base Score:**
+
+* ISS = 0.22
+* Impact (Unchanged) = 6.42 × 0.22 ≈ 1.41
+* Exploitability = 8.22 × 0.85 × 0.44 × 0.85 × 0.85 ≈ 2.08
+* Base Score = 1.41 + 2.08 ≈ 3.5 → rounded to **3.5**
+
+**Step 6 — Escalation:**
+
+* Moderate PHI: C is N → bumped to L; I is L → stays L.
+* Adjusted vector: `C:L, I:L`.
+* Adjusted score ≈ **4.3** (Medium)
+
+**Step 7 — Gate:**
+
+* Score 4.3 < 7.0 PHI threshold and < 8.5 general threshold → **PASS**.
+
+### 11.16 How to Tune the Engine
+
+All thresholds and mappings are in PHP source code, so tuning requires a code change and a new CI image build:
+
+| Tuning Goal | File to Edit |
+|-------------|--------------|
+| Add a new CWE mapping | `app/Security/Cvss/FindingMetricsMapper.php` |
+| Add a new ZAP alert keyword | `app/Security/Cvss/CweMapper.php` |
+| Change gate thresholds | `app/Security/Gate/SecurityGate.php` |
+| Add new PHI patterns | `app/Security/Phi/PhiClassifier.php` |
+| Change escalation rules | `app/Security/Cvss/HealthcareEscalator.php` |
+| Change report styling | `app/Security/Reporting/HtmlReportGenerator.php` |
+
+For ephemeral tuning without a code change, the gate threshold could be exposed as a command-line option in `SecurityScoreCommand` in a future iteration.
+
+### 11.17 Testing the Engine Locally
+
+You can run the engine locally against existing reports:
+
+```bash
+# After running the scanners manually, or copying artifacts from CI:
+php artisan security:score \
+  --composer-audit=composer-audit-report.json \
+  --phpstan=phpstan-report.json \
+  --zap=zap_report.json \
+  --output-findings=findings.json \
+  --output-scored=scored_findings.json \
+  --output-html=security-report.html
+```
+
+Open `security-report.html` in a browser to inspect every finding, its base score, its adjusted score, the CVSS vector, and the PHI tier.
+
+### 11.18 Summary of the Scoring Engine
+
+The CVSS scoring engine is a purpose-built risk computation layer that:
+
+* **Normalizes** three incompatible scanner formats into one `Finding` model.
+* **Classifies** each finding by PHI exposure using path and URL pattern matching.
+* **Maps** findings to CWEs and then to CVSS v3.1 base metrics.
+* **Calculates** base and adjusted scores using the official CVSS v3.1 formula.
+* **Escalates** scores when PHI is involved, reflecting healthcare-specific risk.
+* **Gates** the pipeline with two thresholds: a general threshold and a stricter PHI threshold.
+* **Reports** results in JSON, HTML, and trend history for both machines and humans.
+
+Because every step is deterministic and stored in artifacts, a failed pipeline can be reproduced and audited simply by inspecting `findings.json`, `scored_findings.json`, and `security-report.html`.
+
+---
+
+## 12. StyleCI Integration
 
 `.styleci.yml` configures StyleCI, a SaaS that automatically checks PHP, JS, and CSS formatting:
 
@@ -1157,7 +1921,7 @@ StyleCI runs **outside** GitLab CI, in parallel. It can also be configured to au
 
 ---
 
-## 12. Real-World End-to-End Example
+## 13. Real-World End-to-End Example
 
 **Scenario:** A developer named Alice opens a Merge Request that fixes a patient search bug.
 
@@ -1176,27 +1940,27 @@ StyleCI runs **outside** GitLab CI, in parallel. It can also be configured to au
 
 ---
 
-## 13. Operational Commands
+## 14. Operational Commands
 
-### 13.1 Build the CI Image Locally
+### 14.1 Build the CI Image Locally
 
 ```bash
 docker build --target ci -t librehealth/ehr-ci:latest -f Dockerfile.ci .
 ```
 
-### 13.2 Build the Runtime Image Locally
+### 14.2 Build the Runtime Image Locally
 
 ```bash
 docker build --target runtime -t librehealth/ehr-runtime:latest -f Dockerfile.ci .
 ```
 
-### 13.3 Run the CI Image Locally
+### 14.3 Run the CI Image Locally
 
 ```bash
 docker run --rm -it -v $(pwd):/app librehealth/ehr-ci:latest bash
 ```
 
-### 13.4 Simulate the ZAP Job Locally
+### 14.4 Simulate the ZAP Job Locally
 
 ```bash
 # Start MySQL
@@ -1227,7 +1991,7 @@ php artisan serve --host=0.0.0.0 --port=8000 &
 
 ---
 
-## 14. Extending to Full CD
+## 15. Extending to Full CD
 
 To turn this CI pipeline into a full CI/CD pipeline, add stages after `cvss-scoring`:
 
@@ -1272,7 +2036,7 @@ In this extended model:
 
 ---
 
-## 15. File Mapping
+## 16. File Mapping
 
 | File | Purpose |
 |------|---------|
@@ -1289,10 +2053,12 @@ In this extended model:
 | `docs/CI_CD_ARCHITECTURE_DIAGRAM.png` | Rendered high-level architecture diagram. |
 | `docs/VULNERABILITY_TRACKING_LIFECYCLE.mmd` | Mermaid source for the vulnerability tracking lifecycle diagram. |
 | `docs/VULNERABILITY_TRACKING_LIFECYCLE.png` | Rendered vulnerability tracking lifecycle diagram. |
+| `docs/CVSS_SCORING_ENGINE_DIAGRAM.mmd` | Mermaid source for the CVSS scoring engine component diagram. |
+| `docs/CVSS_SCORING_ENGINE_DIAGRAM.png` | Rendered CVSS scoring engine component diagram. |
 
 ---
 
-## 16. Summary
+## 17. Summary
 
 This CI/CD architecture is a **security-first, containerized pipeline**:
 
@@ -1302,6 +2068,7 @@ This CI/CD architecture is a **security-first, containerized pipeline**:
 * **Artifacts** pass compiled dependencies and security reports between jobs.
 * **Security scanning** covers syntax, dependencies, static analysis, and dynamic penetration testing.
 * **Vulnerability tracking** turns scanner output into a governed, auditable workflow with CVSS scoring, triage, SLAs, and exception management.
+* **CVSS scoring engine** normalizes heterogeneous scanner reports, classifies PHI exposure, maps findings to CVSS v3.1 metrics, calculates base and healthcare-adjusted scores, and enforces the gate.
 * **CVSS scoring** aggregates all findings into a single, enforceable gate.
 
 The current implementation is a robust CI foundation. Adding a `deploy-staging` and `deploy-production` stage (plus image tagging/push jobs) would complete the full CI/CD lifecycle.
